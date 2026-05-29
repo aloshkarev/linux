@@ -301,7 +301,7 @@ static int init_context(disasm_ctx_t *ctx, const char *arch,
 
 	disassemble_init_for_target(info);
 
-#ifdef DISASM_FOUR_ARGS_SIGNATURE
+#if defined(DISASM_FOUR_ARGS_SIGNATURE) || defined(WIDE_OUTPUT)
 	ctx->disassemble = disassembler(info->arch,
 					bfd_big_endian(bfdf),
 					info->mach,

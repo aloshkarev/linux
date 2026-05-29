@@ -267,10 +267,19 @@ MAX_BTF_SOCK_TYPE,
 extern u32 btf_sock_ids[];
 #endif
 
+#ifdef CONFIG_CACHE_EXT
+#define __BTF_TRACING_TYPE_CACHE_EXT	\
+	BTF_TRACING_TYPE(BTF_TRACING_TYPE_CACHE_EXT_LIST_NODE, cache_ext_list_node)
+#else
+#define __BTF_TRACING_TYPE_CACHE_EXT
+#endif
+
 #define BTF_TRACING_TYPE_xxx	\
 	BTF_TRACING_TYPE(BTF_TRACING_TYPE_TASK, task_struct)	\
 	BTF_TRACING_TYPE(BTF_TRACING_TYPE_FILE, file)		\
-	BTF_TRACING_TYPE(BTF_TRACING_TYPE_VMA, vm_area_struct)
+	BTF_TRACING_TYPE(BTF_TRACING_TYPE_VMA, vm_area_struct)	\
+	/* cache_ext types are optional */			\
+	__BTF_TRACING_TYPE_CACHE_EXT
 
 enum {
 #define BTF_TRACING_TYPE(name, type) name,

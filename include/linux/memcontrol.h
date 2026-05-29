@@ -23,12 +23,16 @@
 #include <linux/writeback.h>
 #include <linux/page-flags.h>
 #include <linux/shrinker.h>
+#ifdef CONFIG_CACHE_EXT
+#include <linux/cache_ext.h>
+#endif
 
 struct mem_cgroup;
 struct obj_cgroup;
 struct page;
 struct mm_struct;
 struct kmem_cache;
+struct file;
 
 /* Cgroup-specific page state, on top of universal node page state */
 enum memcg_stat_item {
@@ -82,6 +86,94 @@ struct mem_cgroup_reclaim_iter {
 	atomic_t generation;
 };
 
+#ifdef CONFIG_CACHE_EXT
+/*
+ * cache_ext: valid folios set and helpers
+ */
+
+/* Support up to 20 GiB of memory. Each bucket represents 4KiB of memory. */
+#define VALID_FOLIOS_SET_SIZE_POW 23
+#define VALID_FOLIOS_SET_SIZE (1 << VALID_FOLIOS_SET_SIZE_POW)
+
+struct valid_folios_set {
+	DECLARE_HASHTABLE(valid_folios, VALID_FOLIOS_SET_SIZE_POW);
+	spinlock_t bucket_locks[VALID_FOLIOS_SET_SIZE];
+	atomic64_t nr_entries;
+};
+
+struct valid_folio {
+	struct hlist_node h_node;
+	uintptr_t folio_ptr;
+	struct cache_ext_list_node *cache_ext_node;
+	bool prefetched;
+	u64 file_id;
+};
+
+#define CACHE_EXT_FILE_STATS_BITS 10
+struct cache_ext_file_stats_entry {
+	struct hlist_node h_node;
+	u64 file_id;
+	atomic64_t prefetch_added;
+	atomic64_t prefetch_hit;
+	atomic64_t prefetch_miss;
+};
+
+struct cache_ext_file_stats {
+	DECLARE_HASHTABLE(table, CACHE_EXT_FILE_STATS_BITS);
+	spinlock_t lock;
+};
+
+#define CACHE_EXT_INODE_STATS_BITS 10
+
+struct cache_ext_inode_stats_entry {
+	struct hlist_node h_node;
+	u64 ino;
+	atomic64_t prefetch_added;
+	atomic64_t prefetch_hit;
+	atomic64_t prefetch_miss;
+};
+
+struct cache_ext_inode_stats {
+	DECLARE_HASHTABLE(table, CACHE_EXT_INODE_STATS_BITS);
+	spinlock_t lock;
+};
+
+bool cache_ext_cgroup_enabled(struct cgroup *cgroup);
+struct cache_ext_ops *get_cache_ext_ops(struct mem_cgroup *memcg);
+
+struct valid_folios_set *init_valid_folios_set(int node, u64 num_buckets);
+void free_valid_folios_set(struct valid_folios_set *valid_folios_set);
+void valid_folios_add(struct folio *folio);
+void valid_folios_del(struct folio *folio);
+bool valid_folios_exists(struct valid_folios_set *valid_folios_set, struct folio *folio);
+bool valid_folios_exists_unlocked(struct valid_folios_set *valid_folios_set,
+				  struct folio *folio);
+struct valid_folios_set *lruvec_to_valid_folios_set(struct lruvec *lruvec);
+struct valid_folio *valid_folios_lookup(struct folio *folio);
+struct valid_folios_set *folio_to_valid_folios_set(struct folio *folio);
+spinlock_t *valid_folios_set_get_bucket_lock(struct valid_folios_set *valid_folios_set,
+					     struct folio *folio);
+void valid_folios_clear_list(struct valid_folios_set *valid_folios_set);
+struct valid_folios_set *memcg_to_valid_folios_set(struct mem_cgroup *memcg);
+
+void cache_ext_ra_account_prefetch(struct folio *folio, struct file *file);
+void cache_ext_ra_account_access(struct folio *folio);
+void cache_ext_ra_account_evict(struct folio *folio);
+bool cache_ext_inode_stats_snapshot(struct mem_cgroup *memcg, u64 ino,
+				    u64 *prefetch_added,
+				    u64 *prefetch_hit,
+				    u64 *prefetch_miss,
+				    u64 *prefetch_inflight);
+bool cache_ext_file_stats_snapshot(struct mem_cgroup *memcg, u64 file_id,
+				   u64 *prefetch_added,
+				   u64 *prefetch_hit,
+				   u64 *prefetch_miss,
+				   u64 *prefetch_inflight);
+
+int cache_ext_memcg_init(struct mem_cgroup *memcg);
+void cache_ext_memcg_exit(struct mem_cgroup *memcg);
+#endif
+
 /*
  * per-node information in memory controller.
  */
@@ -110,6 +202,10 @@ struct mem_cgroup_per_node {
 #endif
 
 	/* Fields which get updated often at the end. */
+#ifdef CONFIG_CACHE_EXT
+	struct valid_folios_set *valid_folios_set;
+	struct cache_ext_ds_registry cache_ext_ds_registry;
+#endif
 	struct lruvec		lruvec;
 	CACHELINE_PADDING(_pad2_);
 	unsigned long		lru_zone_size[MAX_NR_ZONES][NR_LRU_LISTS];
@@ -322,6 +418,15 @@ struct mem_cgroup {
 	struct list_head event_list;
 	spinlock_t event_list_lock;
 #endif /* CONFIG_MEMCG_V1 */
+
+#ifdef CONFIG_CACHE_EXT
+	bool cache_ext_valid;
+	atomic64_t cache_ext_ra_prefetch_added;
+	atomic64_t cache_ext_ra_prefetch_hit;
+	atomic64_t cache_ext_ra_prefetch_miss;
+	struct cache_ext_file_stats cache_ext_file_stats;
+	struct cache_ext_inode_stats cache_ext_inode_stats;
+#endif
 
 	struct mem_cgroup_per_node *nodeinfo[];
 };

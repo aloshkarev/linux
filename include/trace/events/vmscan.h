@@ -607,6 +607,29 @@ TRACE_EVENT(mm_vmscan_kswapd_clear_hopeless,
 		__entry->nid,
 		__print_symbolic(__entry->reason, kswapd_clear_hopeless_reason_ops))
 );
+
+TRACE_EVENT(mm_cache_ext_reclaim,
+	TP_PROTO(void *memcg, unsigned long requested, unsigned long nominated,
+		 unsigned long isolated, unsigned long reclaimed),
+	TP_ARGS(memcg, requested, nominated, isolated, reclaimed),
+	TP_STRUCT__entry(
+		__field(void *, memcg)
+		__field(unsigned long, requested)
+		__field(unsigned long, nominated)
+		__field(unsigned long, isolated)
+		__field(unsigned long, reclaimed)
+	),
+	TP_fast_assign(
+		__entry->memcg = memcg;
+		__entry->requested = requested;
+		__entry->nominated = nominated;
+		__entry->isolated = isolated;
+		__entry->reclaimed = reclaimed;
+	),
+	TP_printk("memcg=%p requested=%lu nominated=%lu isolated=%lu reclaimed=%lu",
+		  __entry->memcg, __entry->requested, __entry->nominated,
+		  __entry->isolated, __entry->reclaimed)
+);
 #endif /* _TRACE_VMSCAN_H */
 
 /* This part must be outside protection */

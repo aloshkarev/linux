@@ -533,6 +533,11 @@ static int cgroup_bpf_inherit(struct cgroup *cgrp)
 	for (i = 0; i < NR; i++)
 		activate_effective_progs(cgrp, i, arrays[i]);
 
+#ifdef CONFIG_CACHE_EXT
+	WRITE_ONCE(cgrp->bpf.cache_ext_enabled, false);
+	RCU_INIT_POINTER(cgrp->bpf.cache_ext_ops, NULL);
+#endif
+
 	return 0;
 cleanup:
 	for (i = 0; i < NR; i++)

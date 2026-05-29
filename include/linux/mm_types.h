@@ -1991,4 +1991,69 @@ static inline unsigned long mmf_init_legacy_flags(unsigned long flags)
 	return flags & MMF_INIT_LEGACY_MASK;
 }
 
+#ifdef CONFIG_CACHE_EXT
+/*
+ * cache_ext
+ */
+struct cache_ext_eviction_ctx {
+	/* Input */
+	unsigned long request_nr_folios_to_evict;
+	/* Output */
+	unsigned long nr_folios_to_evict;
+	struct folio *folios_to_evict[32];
+	s64 scores[32];
+};
+
+enum cache_ext_admit_action {
+	CACHE_EXT_ADMIT_CACHE = 0,
+	CACHE_EXT_ADMIT_SKIP = 1,
+	CACHE_EXT_ADMIT_PREALLOC = 2,
+};
+
+struct cache_ext_admission_ctx {
+	/* Input */
+	u64 ino;
+	u64 file_id;
+	u64 offset;
+	u64 size;
+	u64 i_size;
+	u64 ra_prev_pos;
+	u32 ra_size;
+	u32 ra_async_size;
+	u32 ra_order;
+	u32 ra_pages_max;
+	u32 iocb_flags;
+
+	/* Output */
+	u32 readahead_pages;
+	u32 prealloc_pages;
+	u32 dropbehind;
+	u64 ra_prefetch_added;
+	u64 ra_prefetch_hit;
+	u64 ra_prefetch_miss;
+	u64 ra_prefetch_inflight;
+	u64 inode_ra_prefetch_added;
+	u64 inode_ra_prefetch_hit;
+	u64 inode_ra_prefetch_miss;
+	u64 inode_ra_prefetch_inflight;
+	u64 file_ra_prefetch_added;
+	u64 file_ra_prefetch_hit;
+	u64 file_ra_prefetch_miss;
+	u64 file_ra_prefetch_inflight;
+};
+
+/* TODO: How can I make only some fields cache_ext_eviction_ctx writeable? */
+struct cache_ext_ops {
+	/* Implement bpf_verifier_ops */
+	s32 (*init)(struct mem_cgroup *memcg);
+	void (*evict_folios)(struct cache_ext_eviction_ctx *ctx,
+			     struct mem_cgroup *memcg);
+	void (*folio_added)(struct folio *folio);
+	void (*folio_accessed)(struct folio *folio);
+	void (*folio_evicted)(struct folio *folio);
+	s32 (*admit_folio)(struct cache_ext_admission_ctx *ctx);
+	/* TODO: Add name? */
+};
+#endif /* CONFIG_CACHE_EXT */
+
 #endif /* _LINUX_MM_TYPES_H */

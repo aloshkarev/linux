@@ -128,6 +128,9 @@
 #include <linux/blk-cgroup.h>
 #include <linux/fadvise.h>
 #include <linux/sched/mm.h>
+#ifdef CONFIG_CACHE_EXT
+#include <linux/memcontrol.h>
+#endif
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/readahead.h>
@@ -289,6 +292,9 @@ void page_cache_ra_unbounded(struct readahead_control *ractl,
 			i = ractl->_index + ractl->_nr_pages - index;
 			continue;
 		}
+#ifdef CONFIG_CACHE_EXT
+		cache_ext_ra_account_prefetch(folio, ractl->file);
+#endif
 		if (i == mark)
 			folio_set_readahead(folio);
 		ractl->_workingset |= folio_test_workingset(folio);
@@ -458,6 +464,9 @@ static inline int ra_alloc_folio(struct readahead_control *ractl, pgoff_t index,
 		folio_put(folio);
 		return err;
 	}
+#ifdef CONFIG_CACHE_EXT
+	cache_ext_ra_account_prefetch(folio, ractl->file);
+#endif
 
 	ractl->_nr_pages += 1UL << order;
 	ractl->_workingset |= folio_test_workingset(folio);
@@ -797,6 +806,9 @@ void readahead_expand(struct readahead_control *ractl,
 			folio_put(folio);
 			return;
 		}
+#ifdef CONFIG_CACHE_EXT
+		cache_ext_ra_account_prefetch(folio, ractl->file);
+#endif
 		if (unlikely(folio_test_workingset(folio)) &&
 				!ractl->_workingset) {
 			ractl->_workingset = true;
@@ -826,6 +838,9 @@ void readahead_expand(struct readahead_control *ractl,
 			folio_put(folio);
 			return;
 		}
+#ifdef CONFIG_CACHE_EXT
+		cache_ext_ra_account_prefetch(folio, ractl->file);
+#endif
 		if (unlikely(folio_test_workingset(folio)) &&
 				!ractl->_workingset) {
 			ractl->_workingset = true;

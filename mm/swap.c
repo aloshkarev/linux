@@ -462,6 +462,23 @@ void folio_mark_accessed(struct folio *folio)
 {
 	if (folio_test_dropbehind(folio))
 		return;
+
+#ifdef CONFIG_CACHE_EXT
+	/* cache_ext: folio_accessed hook */
+	{
+		struct mem_cgroup *memcg = folio_memcg(folio);
+		struct cache_ext_ops *pcext_ops;
+
+		rcu_read_lock();
+		pcext_ops = get_cache_ext_ops(memcg);
+		if (pcext_ops && pcext_ops->folio_accessed)
+			pcext_ops->folio_accessed(folio);
+		rcu_read_unlock();
+
+		cache_ext_ra_account_access(folio);
+	}
+#endif
+
 	if (lru_gen_enabled()) {
 		lru_gen_inc_refs(folio);
 		return;

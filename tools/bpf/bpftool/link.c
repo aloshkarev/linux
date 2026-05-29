@@ -583,6 +583,12 @@ static int show_link_close_json(int fd, struct bpf_link_info *info)
 		jsonw_uint_field(json_wtr, "map_id",
 				 info->struct_ops.map_id);
 		break;
+	case BPF_LINK_TYPE_CACHE_EXT_OPS:
+		jsonw_lluint_field(json_wtr, "cgroup_id",
+				   info->cache_ext_ops.cgroup_id);
+		jsonw_uint_field(json_wtr, "map_id",
+				 info->cache_ext_ops.map_id);
+		break;
 	case BPF_LINK_TYPE_KPROBE_MULTI:
 		show_kprobe_multi_json(info, json_wtr);
 		break;
@@ -643,6 +649,8 @@ static void show_link_header_plain(struct bpf_link_info *info)
 
 	if (info->type == BPF_LINK_TYPE_STRUCT_OPS)
 		printf("map %u  ", info->struct_ops.map_id);
+	else if (info->type == BPF_LINK_TYPE_CACHE_EXT_OPS)
+		printf("map %u  ", info->cache_ext_ops.map_id);
 	else
 		printf("prog %u  ", info->prog_id);
 }
@@ -982,6 +990,11 @@ static int show_link_close_plain(int fd, struct bpf_link_info *info)
 	case BPF_LINK_TYPE_XDP:
 		printf("\n\t");
 		show_link_ifindex_plain(info->xdp.ifindex);
+		break;
+	case BPF_LINK_TYPE_CACHE_EXT_OPS:
+		printf("\n\tcgroup_id %zu  map_id %u  ",
+		       (size_t)info->cache_ext_ops.cgroup_id,
+		       info->cache_ext_ops.map_id);
 		break;
 	case BPF_LINK_TYPE_KPROBE_MULTI:
 		show_kprobe_multi_plain(info);

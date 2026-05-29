@@ -1396,6 +1396,17 @@ config LRU_GEN_WALKS_MMU
 	depends on LRU_GEN && ARCH_HAS_HW_PTE_YOUNG
 # }
 
+config CACHE_EXT
+	bool "BPF-driven page cache extension"
+	depends on MEMCG && CGROUP_BPF
+	depends on BPF && BPF_SYSCALL && BPF_JIT
+	depends on DEBUG_INFO_BTF
+	help
+	  Enable cache_ext, a BPF-driven page cache extension that allows
+	  custom admission and eviction policies via BPF struct_ops and
+	  kfunc helpers. This integrates with memcg and cgroup-bpf. If unsure,
+	  say N.
+
 config ARCH_SUPPORTS_PER_VMA_LOCK
        def_bool n
 

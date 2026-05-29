@@ -9,6 +9,9 @@
 #include <linux/workqueue.h>
 
 struct bpf_prog_array;
+#ifdef CONFIG_CACHE_EXT
+struct cache_ext_ops;
+#endif
 
 #ifdef CONFIG_BPF_LSM
 /* Maximum number of concurrently attachable per-cgroup LSM hooks. */
@@ -76,6 +79,11 @@ struct cgroup_bpf {
 
 	/* cgroup_bpf is released using a work queue */
 	struct work_struct release_work;
+
+#ifdef CONFIG_CACHE_EXT
+	bool cache_ext_enabled;
+	struct cache_ext_ops __rcu *cache_ext_ops;
+#endif
 };
 
 #else /* CONFIG_CGROUP_BPF */

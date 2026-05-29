@@ -316,8 +316,8 @@ struct bpf_reference_state {
 };
 
 struct bpf_retval_range {
-	s32 minval;
-	s32 maxval;
+	s64 minval;
+	s64 maxval;
 	bool return_32bit;
 };
 

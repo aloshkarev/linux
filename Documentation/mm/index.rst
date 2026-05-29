@@ -19,6 +19,8 @@ see the :doc:`admin guide <../admin-guide/mm/index>`.
    slab
    highmem
    page_reclaim
+   cache-ext
+   cache-ext-mglru
    swap
    swap-table
    page_cache

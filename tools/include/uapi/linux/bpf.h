@@ -1154,6 +1154,7 @@ enum bpf_attach_type {
 	BPF_TRACE_KPROBE_SESSION,
 	BPF_TRACE_UPROBE_SESSION,
 	BPF_TRACE_FSESSION,
+	BPF_CACHE_EXT_OPS,
 	__MAX_BPF_ATTACH_TYPE
 };
 
@@ -1178,6 +1179,7 @@ enum bpf_link_type {
 	BPF_LINK_TYPE_UPROBE_MULTI = 12,
 	BPF_LINK_TYPE_NETKIT = 13,
 	BPF_LINK_TYPE_SOCKMAP = 14,
+	BPF_LINK_TYPE_CACHE_EXT_OPS = 15,
 	__MAX_BPF_LINK_TYPE,
 };
 
@@ -6786,6 +6788,10 @@ struct bpf_link_info {
 		struct {
 			__u32 map_id;
 		} struct_ops;
+		struct {
+			__u64 cgroup_id;
+			__u32 map_id;
+		} cache_ext_ops;
 		struct {
 			__u32 pf;
 			__u32 hooknum;

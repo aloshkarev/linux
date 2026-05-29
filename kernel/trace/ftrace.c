@@ -6294,13 +6294,13 @@ static unsigned long hash_count(struct ftrace_hash *hash)
 }
 
 /**
- * hash_add - adds two struct ftrace_hash and returns the result
+ * ftrace_hash_combine - adds two struct ftrace_hash and returns the result
  * @a: struct ftrace_hash object
  * @b: struct ftrace_hash object
  *
  * Returns struct ftrace_hash object on success, NULL on error.
  */
-static struct ftrace_hash *hash_add(struct ftrace_hash *a, struct ftrace_hash *b)
+static struct ftrace_hash *ftrace_hash_combine(struct ftrace_hash *a, struct ftrace_hash *b)
 {
 	struct ftrace_func_entry *entry;
 	struct ftrace_hash *add;
@@ -6375,11 +6375,11 @@ int update_ftrace_direct_add(struct ftrace_ops *ops, struct ftrace_hash *hash)
 	}
 
 	err = -ENOMEM;
-	new_filter_hash = hash_add(old_filter_hash, hash);
+	new_filter_hash = ftrace_hash_combine(old_filter_hash, hash);
 	if (!new_filter_hash)
 		goto out_unlock;
 
-	new_direct_functions = hash_add(direct_functions, hash);
+	new_direct_functions = ftrace_hash_combine(direct_functions, hash);
 	if (!new_direct_functions)
 		goto out_unlock;
 

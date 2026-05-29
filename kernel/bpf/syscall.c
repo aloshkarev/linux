@@ -5735,6 +5735,11 @@ static int link_create(union bpf_attr *attr, bpfptr_t uattr)
 	if (attr->link_create.attach_type == BPF_STRUCT_OPS)
 		return bpf_struct_ops_link_create(attr);
 
+#ifdef CONFIG_CACHE_EXT
+	if (attr->link_create.attach_type == BPF_CACHE_EXT_OPS)
+		return bpf_cache_ext_ops_link_create(attr);
+#endif
+
 	prog = bpf_prog_get(attr->link_create.prog_fd);
 	if (IS_ERR(prog))
 		return PTR_ERR(prog);

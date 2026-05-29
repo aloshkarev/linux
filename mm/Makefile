@@ -56,6 +56,7 @@ obj-y			:= filemap.o mempool.o oom_kill.o fadvise.o \
 			   compaction.o show_mem.o \
 			   interval_tree.o list_lru.o workingset.o \
 			   debug.o gup.o mmap_lock.o vma_init.o $(mmu-y)
+obj-$(CONFIG_CACHE_EXT)	+= cache_ext.o cache_ext_ds.o
 
 # Give 'page_alloc' its own module-parameter namespace
 page-alloc-y := page_alloc.o

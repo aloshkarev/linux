@@ -2121,6 +2121,10 @@ int bpf_struct_ops_link_create(union bpf_attr *attr);
 int bpf_prog_assoc_struct_ops(struct bpf_prog *prog, struct bpf_map *map);
 void bpf_prog_disassoc_struct_ops(struct bpf_prog *prog);
 void *bpf_prog_get_assoc_struct_ops(const struct bpf_prog_aux *aux);
+#ifdef CONFIG_CACHE_EXT
+int bpf_cache_ext_ops_link_create(union bpf_attr *attr);
+struct cgroup *bpf_cache_ext_link_cgroup(struct bpf_link *link);
+#endif
 u32 bpf_struct_ops_id(const void *kdata);
 
 #ifdef CONFIG_NET

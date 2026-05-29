@@ -36,6 +36,8 @@
 #include <linux/cpuset.h>
 #include <linux/hugetlb.h>
 #include <linux/memcontrol.h>
+#include <linux/workqueue.h>
+#include <linux/preempt.h>
 #include <linux/shmem_fs.h>
 #include <linux/rmap.h>
 #include <linux/delayacct.h>
@@ -223,6 +225,25 @@ void __filemap_remove_folio(struct folio *folio, void *shadow)
 {
 	struct address_space *mapping = folio->mapping;
 
+#ifdef CONFIG_CACHE_EXT
+	/* cache_ext: folio_evicted hook */
+	{
+		struct mem_cgroup *memcg = folio_memcg(folio);
+		struct cache_ext_ops *pcext_ops;
+
+		rcu_read_lock();
+		pcext_ops = get_cache_ext_ops(memcg);
+		if (pcext_ops && pcext_ops->folio_evicted)
+			pcext_ops->folio_evicted(folio);
+		rcu_read_unlock();
+
+		if (memcg && memcg->cache_ext_valid) {
+			cache_ext_ra_account_evict(folio);
+			valid_folios_del(folio);
+		}
+	}
+#endif
+
 	trace_mm_filemap_delete_from_page_cache(folio);
 	filemap_unaccount_folio(mapping, folio);
 	page_cache_delete(mapping, folio, shadow);
@@ -330,6 +351,25 @@ void delete_from_page_cache_batch(struct address_space *mapping,
 	xa_lock_irq(&mapping->i_pages);
 	for (i = 0; i < folio_batch_count(fbatch); i++) {
 		struct folio *folio = fbatch->folios[i];
+
+#ifdef CONFIG_CACHE_EXT
+		/* cache_ext: folio_evicted hook */
+		{
+			struct mem_cgroup *memcg = folio_memcg(folio);
+			struct cache_ext_ops *pcext_ops;
+
+		rcu_read_lock();
+		pcext_ops = get_cache_ext_ops(memcg);
+		if (pcext_ops && pcext_ops->folio_evicted)
+			pcext_ops->folio_evicted(folio);
+		rcu_read_unlock();
+
+		if (memcg && memcg->cache_ext_valid) {
+			cache_ext_ra_account_evict(folio);
+			valid_folios_del(folio);
+		}
+		}
+#endif
 
 		trace_mm_filemap_delete_from_page_cache(folio);
 		filemap_unaccount_folio(mapping, folio);
@@ -936,6 +976,23 @@ unlock:
 
 	if (xas_error(&xas))
 		goto error;
+
+#ifdef CONFIG_CACHE_EXT
+	/* cache_ext: folio_added hook */
+	{
+		struct mem_cgroup *memcg = folio_memcg(folio);
+		struct cache_ext_ops *pcext_ops;
+
+		if (memcg && memcg->cache_ext_valid)
+			valid_folios_add(folio);
+
+		rcu_read_lock();
+		pcext_ops = get_cache_ext_ops(memcg);
+		if (pcext_ops && pcext_ops->folio_added)
+			pcext_ops->folio_added(folio);
+		rcu_read_unlock();
+	}
+#endif
 
 	trace_mm_filemap_add_to_page_cache(folio);
 	return 0;
@@ -2515,6 +2572,31 @@ static int filemap_read_folio(struct file *file, filler_t filler,
 	return -EIO;
 }
 
+#ifdef CONFIG_CACHE_EXT
+static int filemap_read_folio_cache_ext(struct file *file, filler_t filler,
+					struct folio *folio)
+{
+	bool workingset = folio_test_workingset(folio);
+	unsigned long pflags;
+	int error;
+
+	/* Start the actual read. The read will unlock the folio. */
+	if (unlikely(workingset))
+		psi_memstall_enter(&pflags);
+	error = filler(file, folio);
+	if (unlikely(workingset))
+		psi_memstall_leave(&pflags);
+	if (error)
+		return error;
+
+	error = folio_wait_locked_killable(folio);
+	if (error)
+		return error;
+
+	return 0;
+}
+#endif
+
 static bool filemap_range_uptodate(struct address_space *mapping,
 		loff_t pos, size_t count, struct folio *folio,
 		bool need_uptodate)
@@ -2665,6 +2747,98 @@ static int filemap_readahead(struct kiocb *iocb, struct file *file,
 	return 0;
 }
 
+#ifdef CONFIG_CACHE_EXT
+struct cache_ext_ra_work {
+	struct work_struct work;
+	struct file *file;
+	pgoff_t index;
+	unsigned long ra_pages;
+	bool dropbehind;
+};
+
+static void cache_ext_ra_workfn(struct work_struct *work)
+{
+	struct cache_ext_ra_work *ra_work =
+		container_of(work, struct cache_ext_ra_work, work);
+	struct address_space *mapping = ra_work->file->f_mapping;
+	DEFINE_READAHEAD(ractl, ra_work->file, &ra_work->file->f_ra, mapping,
+			 ra_work->index);
+
+	if (ra_work->dropbehind)
+		ractl.dropbehind = 1;
+
+	page_cache_sync_ra(&ractl, ra_work->ra_pages);
+	fput(ra_work->file);
+	kfree(ra_work);
+}
+
+void cache_ext_schedule_prealloc(struct file *file, u64 index,
+				 unsigned long ra_pages, bool dropbehind)
+{
+	struct cache_ext_ra_work *ra_work;
+	gfp_t gfp = in_atomic() ? GFP_ATOMIC : GFP_KERNEL;
+
+	if (!ra_pages)
+		return;
+
+	ra_work = kzalloc(sizeof(*ra_work), gfp);
+	if (!ra_work)
+		return;
+
+	ra_work->file = get_file(file);
+	ra_work->index = (pgoff_t)index;
+	ra_work->ra_pages = ra_pages;
+	ra_work->dropbehind = dropbehind;
+	INIT_WORK(&ra_work->work, cache_ext_ra_workfn);
+	queue_work(system_unbound_wq, &ra_work->work);
+}
+#endif
+
+#ifdef CONFIG_CACHE_EXT
+static int __cache_ext_dio(struct file *file, struct address_space *mapping,
+			   struct kiocb *iocb, size_t count,
+			   struct folio_batch *fbatch)
+{
+	struct folio *folio;
+	pgoff_t index = iocb->ki_pos >> PAGE_SHIFT;
+	pgoff_t last_index = DIV_ROUND_UP(iocb->ki_pos + count, PAGE_SIZE);
+	pgoff_t i;
+	int error;
+
+	for (i = index; i < last_index; i++) {
+		folio = filemap_alloc_folio(mapping_gfp_mask(mapping), 0, NULL);
+		if (!folio) {
+			if (i == index)
+				return -ENOMEM;
+			/* Some folios are already prepared, let caller consume */
+			return 1;
+		}
+
+		filemap_invalidate_lock_shared(mapping);
+		__folio_set_locked(folio);
+		folio_ref_add(folio, folio_nr_pages(folio));
+		folio->mapping = mapping;
+		folio->index = i;
+
+		error = filemap_read_folio_cache_ext(
+			file, mapping->a_ops->read_folio, folio);
+		filemap_invalidate_unlock_shared(mapping);
+		if (error) {
+			if (i == index)
+				return error;
+			return 1;
+		}
+
+		/* Don't overflow fbatch */
+		if (!folio_batch_add(fbatch, folio))
+			break;
+	}
+
+	/* Return 1 to signify cache_ext path */
+	return 1;
+}
+#endif
+
 static int filemap_get_pages(struct kiocb *iocb, size_t count,
 		struct folio_batch *fbatch, bool need_uptodate)
 {
@@ -2685,6 +2859,92 @@ retry:
 
 	filemap_get_read_batch(mapping, index, last_index - 1, fbatch);
 	if (!folio_batch_count(fbatch)) {
+		unsigned long ra_pages = last_index - index;
+		bool cache_ext_dropbehind = false;
+#ifdef CONFIG_CACHE_EXT
+		unsigned long prealloc_pages = 0;
+#endif
+#ifdef CONFIG_CACHE_EXT
+		struct mem_cgroup *memcg;
+		struct cache_ext_ops *cache_ext_ops;
+		struct cache_ext_admission_ctx ctx = { 0 };
+		s32 decision = CACHE_EXT_ADMIT_CACHE;
+
+		/* cache_ext admission hook */
+		ctx.ino = filp->f_inode->i_ino;
+		ctx.file_id = (u64)(uintptr_t)filp;
+		ctx.offset = iocb->ki_pos;
+		ctx.size = count;
+		ctx.i_size = i_size_read(filp->f_inode);
+		ctx.ra_prev_pos = filp->f_ra.prev_pos;
+		ctx.ra_size = filp->f_ra.size;
+		ctx.ra_async_size = filp->f_ra.async_size;
+		ctx.ra_order = filp->f_ra.order;
+		ctx.ra_pages_max = filp->f_ra.ra_pages;
+		ctx.iocb_flags = iocb->ki_flags;
+
+		rcu_read_lock();
+		memcg = mem_cgroup_from_task(current);
+		cache_ext_ops = get_cache_ext_ops(memcg);
+		if (cache_ext_ops && cache_ext_ops->admit_folio) {
+			ctx.ra_prefetch_added =
+				atomic64_read(&memcg->cache_ext_ra_prefetch_added);
+			ctx.ra_prefetch_hit =
+				atomic64_read(&memcg->cache_ext_ra_prefetch_hit);
+			ctx.ra_prefetch_miss =
+				atomic64_read(&memcg->cache_ext_ra_prefetch_miss);
+			ctx.ra_prefetch_inflight =
+				ctx.ra_prefetch_added -
+				ctx.ra_prefetch_hit -
+				ctx.ra_prefetch_miss;
+			cache_ext_inode_stats_snapshot(memcg, ctx.ino,
+						       &ctx.inode_ra_prefetch_added,
+						       &ctx.inode_ra_prefetch_hit,
+						       &ctx.inode_ra_prefetch_miss,
+						       &ctx.inode_ra_prefetch_inflight);
+			ctx.file_ra_prefetch_added = 0;
+			ctx.file_ra_prefetch_hit = 0;
+			ctx.file_ra_prefetch_miss = 0;
+			ctx.file_ra_prefetch_inflight = 0;
+			cache_ext_file_stats_snapshot(memcg, ctx.file_id,
+						      &ctx.file_ra_prefetch_added,
+						      &ctx.file_ra_prefetch_hit,
+						      &ctx.file_ra_prefetch_miss,
+						      &ctx.file_ra_prefetch_inflight);
+			preempt_disable();
+			cache_ext_set_prealloc_file(filp);
+			decision = cache_ext_ops->admit_folio(&ctx);
+			cache_ext_clear_prealloc_file();
+			preempt_enable();
+		}
+		rcu_read_unlock();
+
+		if (decision < CACHE_EXT_ADMIT_CACHE ||
+		    decision > CACHE_EXT_ADMIT_PREALLOC)
+			decision = CACHE_EXT_ADMIT_CACHE;
+
+		if (decision == CACHE_EXT_ADMIT_SKIP)
+			return __cache_ext_dio(filp, mapping, iocb, count, fbatch);
+
+		if (decision == CACHE_EXT_ADMIT_PREALLOC) {
+			prealloc_pages = ctx.prealloc_pages ?
+				ctx.prealloc_pages : ra_pages;
+			if (!ctx.readahead_pages)
+				ra_pages = 0;
+			else
+				ra_pages = ctx.readahead_pages;
+		} else if (ctx.readahead_pages) {
+			ra_pages = ctx.readahead_pages;
+		}
+
+		if (ctx.ra_pages_max)
+			ra_pages = min(ra_pages, (unsigned long)ctx.ra_pages_max);
+
+		if (ctx.ra_pages_max)
+			prealloc_pages = min(prealloc_pages,
+					     (unsigned long)ctx.ra_pages_max);
+		cache_ext_dropbehind = ctx.dropbehind;
+#endif
 		DEFINE_READAHEAD(ractl, filp, &filp->f_ra, mapping, index);
 
 		if (iocb->ki_flags & IOCB_NOIO)
@@ -2693,7 +2953,21 @@ retry:
 			flags = memalloc_noio_save();
 		if (iocb->ki_flags & IOCB_DONTCACHE)
 			ractl.dropbehind = 1;
-		page_cache_sync_ra(&ractl, last_index - index);
+		if (cache_ext_dropbehind)
+			ractl.dropbehind = 1;
+ #ifdef CONFIG_CACHE_EXT
+		if (!(iocb->ki_flags & IOCB_NOIO))
+			cache_ext_schedule_prealloc(filp, index, prealloc_pages,
+						    cache_ext_dropbehind);
+ #endif
+		if (ra_pages)
+			page_cache_sync_ra(&ractl, ra_pages);
+ #ifdef CONFIG_CACHE_EXT
+		trace_mm_cache_ext_readahead_decision(mapping, index, count,
+						      decision, ra_pages,
+						      prealloc_pages,
+						      cache_ext_dropbehind);
+ #endif
 		if (iocb->ki_flags & IOCB_NOWAIT)
 			memalloc_noio_restore(flags);
 		filemap_get_read_batch(mapping, index, last_index - 1, fbatch);
@@ -2774,7 +3048,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 	struct address_space *mapping = filp->f_mapping;
 	struct inode *inode = mapping->host;
 	struct folio_batch fbatch;
-	int i, error = 0;
+	int i, error = 0, cache_ext_flag = 0;
 	bool writably_mapped;
 	loff_t isize, end_offset;
 	loff_t last_pos = ra->prev_pos;
@@ -2806,6 +3080,8 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 		error = filemap_get_pages(iocb, iter->count, &fbatch, false);
 		if (error < 0)
 			break;
+		else if (error == 1)
+			cache_ext_flag = 1;
 
 		/*
 		 * i_size must be checked after we know the pages are Uptodate.
@@ -2844,7 +3120,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 
 			if (end_offset < folio_pos(folio))
 				break;
-			if (i > 0)
+			if (i > 0 && !cache_ext_flag)
 				folio_mark_accessed(folio);
 			/*
 			 * If users can be writing to this folio using arbitrary
@@ -2864,14 +3140,20 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 				error = -EFAULT;
 				break;
 			}
+
+			if (cache_ext_flag)
+				filemap_free_folio(mapping, folio);
 		}
 put_folios:
-		for (i = 0; i < folio_batch_count(&fbatch); i++) {
-			struct folio *folio = fbatch.folios[i];
+		if (!cache_ext_flag) {
+			for (i = 0; i < folio_batch_count(&fbatch); i++) {
+				struct folio *folio = fbatch.folios[i];
 
-			filemap_end_dropbehind_read(folio);
-			folio_put(folio);
+				filemap_end_dropbehind_read(folio);
+				folio_put(folio);
+			}
 		}
+		cache_ext_flag = 0;
 		folio_batch_init(&fbatch);
 	} while (iov_iter_count(iter) && iocb->ki_pos < isize && !error);
 

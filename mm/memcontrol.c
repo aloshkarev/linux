@@ -52,6 +52,7 @@
 #include <linux/fs.h>
 #include <linux/seq_file.h>
 #include <linux/vmpressure.h>
+#include <trace/events/filemap.h>
 #include <linux/memremap.h>
 #include <linux/mm_inline.h>
 #include <linux/swap_cgroup.h>
@@ -123,6 +124,605 @@ struct mem_cgroup *vmpressure_to_memcg(struct vmpressure *vmpr)
 {
 	return container_of(vmpr, struct mem_cgroup, vmpressure);
 }
+
+#ifdef CONFIG_CACHE_EXT
+/*
+ * Page Cache Extension (cache_ext).
+ */
+
+bool cache_ext_cgroup_enabled(struct cgroup *cgroup)
+{
+	return READ_ONCE(cgroup->bpf.cache_ext_enabled);
+}
+
+noinline struct cache_ext_ops *get_cache_ext_ops(struct mem_cgroup *memcg)
+{
+	if (!memcg || !memcg->cache_ext_valid)
+		return NULL;
+	if (!cache_ext_cgroup_enabled(memcg->css.cgroup))
+		return NULL;
+	return rcu_dereference_check(memcg->css.cgroup->bpf.cache_ext_ops,
+				     rcu_read_lock_held());
+}
+
+/*
+ * Valid folios set code.
+ */
+static inline uintptr_t folio_ptr_to_key(struct folio *folio)
+{
+	return (uintptr_t)folio;
+}
+
+struct valid_folios_set *folio_to_valid_folios_set(struct folio *folio)
+{
+	struct mem_cgroup *memcg = folio_memcg(folio);
+	pg_data_t *pgdat = folio_pgdat(folio);
+	struct mem_cgroup_per_node *node_cgroup = memcg->nodeinfo[pgdat->node_id];
+
+	return node_cgroup->valid_folios_set;
+}
+
+struct valid_folios_set *memcg_to_valid_folios_set(struct mem_cgroup *memcg)
+{
+	return memcg->nodeinfo[0]->valid_folios_set;
+}
+
+struct valid_folios_set *lruvec_to_valid_folios_set(struct lruvec *lruvec)
+{
+	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+	pg_data_t *pgdat = lruvec_pgdat(lruvec);
+	struct mem_cgroup_per_node *node_cgroup = memcg->nodeinfo[pgdat->node_id];
+
+	return node_cgroup->valid_folios_set;
+}
+
+spinlock_t *valid_folios_set_get_bucket_lock(struct valid_folios_set *valid_folios_set,
+					     struct folio *folio)
+{
+	uintptr_t key = folio_ptr_to_key(folio);
+	int bkt = hash_min(key, VALID_FOLIOS_SET_SIZE_POW);
+
+	if (bkt >= VALID_FOLIOS_SET_SIZE) {
+		pr_err("cache_ext: invalid bucket index: %d\n", bkt);
+		BUG();
+	}
+	return &valid_folios_set->bucket_locks[bkt];
+}
+
+struct valid_folios_set *init_valid_folios_set(int node, u64 num_buckets)
+{
+	struct valid_folios_set *valid_folios_set;
+	int i;
+
+	(void)node;
+	(void)num_buckets;
+
+	valid_folios_set = vmalloc_huge(sizeof(*valid_folios_set),
+					GFP_KERNEL | __GFP_ZERO);
+	if (!valid_folios_set) {
+		pr_err("cache_ext: failed to allocate valid folios set\n");
+		return NULL;
+	}
+
+	atomic64_set(&valid_folios_set->nr_entries, 0);
+	hash_init(valid_folios_set->valid_folios);
+	for (i = 0; i < VALID_FOLIOS_SET_SIZE; i++)
+		spin_lock_init(&valid_folios_set->bucket_locks[i]);
+
+	return valid_folios_set;
+}
+
+void free_valid_folios_set(struct valid_folios_set *valid_folios_set)
+{
+	struct valid_folio *cur;
+	struct hlist_node *tmp;
+	int bkt;
+
+	hash_for_each_safe(valid_folios_set->valid_folios, bkt, tmp, cur, h_node) {
+		hash_del(&cur->h_node);
+		kfree(cur);
+	}
+	vfree(valid_folios_set);
+}
+
+void valid_folios_add(struct folio *folio)
+{
+	struct valid_folios_set *valid_folios_set = folio_to_valid_folios_set(folio);
+	struct valid_folio *new;
+	struct cache_ext_list_node *node;
+	spinlock_t *bucket_lock;
+
+	new = kmalloc(sizeof(*new), GFP_KERNEL);
+	if (!new)
+		return;
+
+	node = cache_ext_list_node_alloc(folio);
+	if (!node) {
+		kfree(new);
+		return;
+	}
+
+	new->folio_ptr = folio_ptr_to_key(folio);
+	new->prefetched = false;
+	new->file_id = 0;
+	bucket_lock = valid_folios_set_get_bucket_lock(valid_folios_set, folio);
+	spin_lock(bucket_lock);
+	if (valid_folios_exists_unlocked(valid_folios_set, folio)) {
+		spin_unlock(bucket_lock);
+		kfree(new);
+		cache_ext_list_node_free(node);
+		return;
+	}
+
+	new->cache_ext_node = node;
+	hash_add(valid_folios_set->valid_folios, &new->h_node, new->folio_ptr);
+	spin_unlock(bucket_lock);
+	atomic64_fetch_add(1, &valid_folios_set->nr_entries);
+}
+
+void valid_folios_del(struct folio *folio)
+{
+	struct valid_folios_set *valid_folios_set = folio_to_valid_folios_set(folio);
+	struct valid_folio *cur;
+	spinlock_t *bucket_lock;
+	uintptr_t key;
+
+	if (in_interrupt())
+		pr_err("cache_ext: valid_folios_del called in irq mode\n");
+
+	key = folio_ptr_to_key(folio);
+	bucket_lock = valid_folios_set_get_bucket_lock(valid_folios_set, folio);
+	spin_lock(bucket_lock);
+	hash_for_each_possible(valid_folios_set->valid_folios, cur, h_node, key) {
+		if (cur->folio_ptr == key) {
+			hash_del(&cur->h_node);
+
+			cache_ext_ds_registry_write_lock(folio);
+			list_del(&cur->cache_ext_node->node);
+			cache_ext_ds_registry_write_unlock(folio);
+
+			cache_ext_list_node_free(cur->cache_ext_node);
+			kfree(cur);
+			spin_unlock(bucket_lock);
+			atomic64_fetch_add(-1, &valid_folios_set->nr_entries);
+			return;
+		}
+	}
+	spin_unlock(bucket_lock);
+}
+
+void valid_folios_clear_list(struct valid_folios_set *valid_folios_set)
+{
+	struct valid_folio *cur;
+	spinlock_t *bucket_lock;
+	int i;
+
+	for (i = 0; i < VALID_FOLIOS_SET_SIZE; i++) {
+		bucket_lock = &valid_folios_set->bucket_locks[i];
+		spin_lock(bucket_lock);
+		hlist_for_each_entry(cur, &valid_folios_set->valid_folios[i], h_node)
+			INIT_LIST_HEAD(&cur->cache_ext_node->node);
+		spin_unlock(bucket_lock);
+	}
+}
+
+bool valid_folios_exists(struct valid_folios_set *valid_folios_set, struct folio *folio)
+{
+	spinlock_t *bucket_lock = valid_folios_set_get_bucket_lock(valid_folios_set, folio);
+	bool ret;
+
+	spin_lock(bucket_lock);
+	ret = valid_folios_exists_unlocked(valid_folios_set, folio);
+	spin_unlock(bucket_lock);
+	return ret;
+}
+
+bool valid_folios_exists_unlocked(struct valid_folios_set *valid_folios_set, struct folio *folio)
+{
+	struct valid_folio *cur;
+	uintptr_t key = folio_ptr_to_key(folio);
+
+	hash_for_each_possible(valid_folios_set->valid_folios, cur, h_node, key) {
+		if (cur->folio_ptr == key)
+			return true;
+	}
+	return false;
+}
+
+struct valid_folio *valid_folios_lookup(struct folio *folio)
+{
+	struct valid_folios_set *valid_folios_set = folio_to_valid_folios_set(folio);
+	struct valid_folio *cur;
+	uintptr_t key = folio_ptr_to_key(folio);
+
+	hash_for_each_possible(valid_folios_set->valid_folios, cur, h_node, key) {
+		if (cur->folio_ptr == key)
+			return cur;
+	}
+	return NULL;
+}
+
+void cache_ext_ra_account_prefetch(struct folio *folio, struct file *file)
+{
+	struct mem_cgroup *memcg = folio_memcg(folio);
+	struct cache_ext_inode_stats_entry *inode_stats, *new_entry;
+	struct cache_ext_file_stats_entry *file_stats, *new_file_entry;
+	struct cache_ext_inode_stats *stats;
+	struct cache_ext_file_stats *file_stats_tbl;
+	struct address_space *mapping;
+	u64 ino;
+	u64 file_id = 0;
+	struct valid_folios_set *valid_folios_set;
+	struct valid_folio *cur;
+	spinlock_t *bucket_lock;
+
+	if (!memcg || !memcg->cache_ext_valid)
+		return;
+
+	mapping = folio->mapping;
+	if (mapping && mapping->host) {
+		ino = mapping->host->i_ino;
+		stats = &memcg->cache_ext_inode_stats;
+		inode_stats = NULL;
+		spin_lock(&stats->lock);
+		hash_for_each_possible(stats->table, inode_stats, h_node, ino) {
+			if (inode_stats->ino == ino)
+				break;
+		}
+		if (inode_stats && inode_stats->ino == ino) {
+			atomic64_inc(&inode_stats->prefetch_added);
+			spin_unlock(&stats->lock);
+		} else {
+			spin_unlock(&stats->lock);
+			new_entry = kmalloc(sizeof(*new_entry), GFP_ATOMIC);
+			if (!new_entry)
+				goto skip_inode_stats;
+			new_entry->ino = ino;
+			atomic64_set(&new_entry->prefetch_added, 1);
+			atomic64_set(&new_entry->prefetch_hit, 0);
+			atomic64_set(&new_entry->prefetch_miss, 0);
+			spin_lock(&stats->lock);
+			hash_for_each_possible(stats->table, inode_stats, h_node, ino) {
+				if (inode_stats->ino == ino)
+					break;
+			}
+			if (inode_stats && inode_stats->ino == ino) {
+				spin_unlock(&stats->lock);
+				kfree(new_entry);
+			} else {
+				hash_add(stats->table, &new_entry->h_node, ino);
+				spin_unlock(&stats->lock);
+			}
+		}
+	}
+skip_inode_stats:
+	if (file)
+		file_id = (u64)(uintptr_t)file;
+	if (file_id) {
+		file_stats_tbl = &memcg->cache_ext_file_stats;
+		file_stats = NULL;
+		spin_lock(&file_stats_tbl->lock);
+		hash_for_each_possible(file_stats_tbl->table, file_stats, h_node, file_id) {
+			if (file_stats->file_id == file_id)
+				break;
+		}
+		if (file_stats && file_stats->file_id == file_id) {
+			atomic64_inc(&file_stats->prefetch_added);
+			spin_unlock(&file_stats_tbl->lock);
+		} else {
+			spin_unlock(&file_stats_tbl->lock);
+			new_file_entry = kmalloc(sizeof(*new_file_entry), GFP_ATOMIC);
+			if (!new_file_entry)
+				goto skip_file_stats;
+			new_file_entry->file_id = file_id;
+			atomic64_set(&new_file_entry->prefetch_added, 1);
+			atomic64_set(&new_file_entry->prefetch_hit, 0);
+			atomic64_set(&new_file_entry->prefetch_miss, 0);
+			spin_lock(&file_stats_tbl->lock);
+			hash_for_each_possible(file_stats_tbl->table, file_stats, h_node, file_id) {
+				if (file_stats->file_id == file_id)
+					break;
+			}
+			if (file_stats && file_stats->file_id == file_id) {
+				spin_unlock(&file_stats_tbl->lock);
+				kfree(new_file_entry);
+			} else {
+				hash_add(file_stats_tbl->table, &new_file_entry->h_node, file_id);
+				spin_unlock(&file_stats_tbl->lock);
+			}
+		}
+	}
+skip_file_stats:
+	valid_folios_set = folio_to_valid_folios_set(folio);
+	bucket_lock = valid_folios_set_get_bucket_lock(valid_folios_set, folio);
+	spin_lock(bucket_lock);
+	cur = valid_folios_lookup(folio);
+	if (cur && !cur->prefetched) {
+		cur->prefetched = true;
+		if (file_id)
+			cur->file_id = file_id;
+		atomic64_inc(&memcg->cache_ext_ra_prefetch_added);
+	}
+	spin_unlock(bucket_lock);
+}
+
+void cache_ext_ra_account_access(struct folio *folio)
+{
+	struct mem_cgroup *memcg = folio_memcg(folio);
+	struct cache_ext_inode_stats_entry *inode_stats;
+	struct cache_ext_file_stats_entry *file_stats;
+	struct cache_ext_inode_stats *stats;
+	struct cache_ext_file_stats *file_stats_tbl;
+	struct address_space *mapping;
+	u64 ino;
+	u64 file_id = 0;
+	bool was_prefetched = false;
+	struct valid_folios_set *valid_folios_set;
+	struct valid_folio *cur;
+	spinlock_t *bucket_lock;
+
+	if (!memcg || !memcg->cache_ext_valid)
+		return;
+
+	mapping = folio->mapping;
+	if (mapping && mapping->host) {
+		ino = mapping->host->i_ino;
+		stats = &memcg->cache_ext_inode_stats;
+		spin_lock(&stats->lock);
+		hash_for_each_possible(stats->table, inode_stats, h_node, ino) {
+			if (inode_stats->ino == ino) {
+				atomic64_inc(&inode_stats->prefetch_hit);
+				break;
+			}
+		}
+		spin_unlock(&stats->lock);
+	}
+
+	valid_folios_set = folio_to_valid_folios_set(folio);
+	bucket_lock = valid_folios_set_get_bucket_lock(valid_folios_set, folio);
+	spin_lock(bucket_lock);
+	cur = valid_folios_lookup(folio);
+	if (cur) {
+		file_id = cur->file_id;
+		if (cur->prefetched) {
+			cur->prefetched = false;
+			was_prefetched = true;
+			atomic64_inc(&memcg->cache_ext_ra_prefetch_hit);
+			trace_mm_cache_ext_prefetch_hit(folio);
+		}
+	}
+	spin_unlock(bucket_lock);
+
+	if (was_prefetched && file_id) {
+		file_stats_tbl = &memcg->cache_ext_file_stats;
+		spin_lock(&file_stats_tbl->lock);
+		hash_for_each_possible(file_stats_tbl->table, file_stats, h_node, file_id) {
+			if (file_stats->file_id == file_id) {
+				atomic64_inc(&file_stats->prefetch_hit);
+				break;
+			}
+		}
+		spin_unlock(&file_stats_tbl->lock);
+	}
+}
+
+void cache_ext_ra_account_evict(struct folio *folio)
+{
+	struct mem_cgroup *memcg = folio_memcg(folio);
+	struct cache_ext_inode_stats_entry *inode_stats;
+	struct cache_ext_file_stats_entry *file_stats;
+	struct cache_ext_inode_stats *stats;
+	struct cache_ext_file_stats *file_stats_tbl;
+	struct address_space *mapping;
+	u64 ino;
+	u64 file_id = 0;
+	bool was_prefetched = false;
+	struct valid_folios_set *valid_folios_set;
+	struct valid_folio *cur;
+	spinlock_t *bucket_lock;
+
+	if (!memcg || !memcg->cache_ext_valid)
+		return;
+
+	mapping = folio->mapping;
+	if (mapping && mapping->host) {
+		ino = mapping->host->i_ino;
+		stats = &memcg->cache_ext_inode_stats;
+		spin_lock(&stats->lock);
+		hash_for_each_possible(stats->table, inode_stats, h_node, ino) {
+			if (inode_stats->ino == ino) {
+				atomic64_inc(&inode_stats->prefetch_miss);
+				break;
+			}
+		}
+		spin_unlock(&stats->lock);
+	}
+
+	valid_folios_set = folio_to_valid_folios_set(folio);
+	bucket_lock = valid_folios_set_get_bucket_lock(valid_folios_set, folio);
+	spin_lock(bucket_lock);
+	cur = valid_folios_lookup(folio);
+	if (cur) {
+		file_id = cur->file_id;
+		if (cur->prefetched) {
+			cur->prefetched = false;
+			was_prefetched = true;
+			atomic64_inc(&memcg->cache_ext_ra_prefetch_miss);
+			trace_mm_cache_ext_prefetch_miss(folio);
+		}
+	}
+	spin_unlock(bucket_lock);
+
+	if (was_prefetched && file_id) {
+		file_stats_tbl = &memcg->cache_ext_file_stats;
+		spin_lock(&file_stats_tbl->lock);
+		hash_for_each_possible(file_stats_tbl->table, file_stats, h_node, file_id) {
+			if (file_stats->file_id == file_id) {
+				atomic64_inc(&file_stats->prefetch_miss);
+				break;
+			}
+		}
+		spin_unlock(&file_stats_tbl->lock);
+	}
+}
+
+bool cache_ext_inode_stats_snapshot(struct mem_cgroup *memcg, u64 ino,
+				    u64 *prefetch_added,
+				    u64 *prefetch_hit,
+				    u64 *prefetch_miss,
+				    u64 *prefetch_inflight)
+{
+	struct cache_ext_inode_stats_entry *inode_stats;
+	struct cache_ext_inode_stats *stats;
+	u64 added = 0, hit = 0, miss = 0;
+
+	if (!memcg || !memcg->cache_ext_valid)
+		return false;
+
+	stats = &memcg->cache_ext_inode_stats;
+	spin_lock(&stats->lock);
+	hash_for_each_possible(stats->table, inode_stats, h_node, ino) {
+		if (inode_stats->ino == ino) {
+			added = atomic64_read(&inode_stats->prefetch_added);
+			hit = atomic64_read(&inode_stats->prefetch_hit);
+			miss = atomic64_read(&inode_stats->prefetch_miss);
+			spin_unlock(&stats->lock);
+			if (prefetch_added)
+				*prefetch_added = added;
+			if (prefetch_hit)
+				*prefetch_hit = hit;
+			if (prefetch_miss)
+				*prefetch_miss = miss;
+			if (prefetch_inflight)
+				*prefetch_inflight = added - hit - miss;
+			return true;
+		}
+	}
+	spin_unlock(&stats->lock);
+	return false;
+}
+
+bool cache_ext_file_stats_snapshot(struct mem_cgroup *memcg, u64 file_id,
+				   u64 *prefetch_added,
+				   u64 *prefetch_hit,
+				   u64 *prefetch_miss,
+				   u64 *prefetch_inflight)
+{
+	struct cache_ext_file_stats_entry *file_stats;
+	struct cache_ext_file_stats *stats;
+	u64 added = 0, hit = 0, miss = 0;
+
+	if (!memcg || !memcg->cache_ext_valid)
+		return false;
+
+	stats = &memcg->cache_ext_file_stats;
+	spin_lock(&stats->lock);
+	hash_for_each_possible(stats->table, file_stats, h_node, file_id) {
+		if (file_stats->file_id == file_id) {
+			added = atomic64_read(&file_stats->prefetch_added);
+			hit = atomic64_read(&file_stats->prefetch_hit);
+			miss = atomic64_read(&file_stats->prefetch_miss);
+			spin_unlock(&stats->lock);
+			if (prefetch_added)
+				*prefetch_added = added;
+			if (prefetch_hit)
+				*prefetch_hit = hit;
+			if (prefetch_miss)
+				*prefetch_miss = miss;
+			if (prefetch_inflight)
+				*prefetch_inflight = added - hit - miss;
+			return true;
+		}
+	}
+	spin_unlock(&stats->lock);
+	return false;
+}
+
+int cache_ext_memcg_init(struct mem_cgroup *memcg)
+{
+	int node;
+	struct mem_cgroup_per_node *pn;
+	struct sysinfo si;
+	u64 memory_in_bytes;
+	u64 max_num_pages;
+	u64 num_buckets;
+
+	if (memcg->cache_ext_valid)
+		return 0;
+
+	atomic64_set(&memcg->cache_ext_ra_prefetch_added, 0);
+	atomic64_set(&memcg->cache_ext_ra_prefetch_hit, 0);
+	atomic64_set(&memcg->cache_ext_ra_prefetch_miss, 0);
+	hash_init(memcg->cache_ext_file_stats.table);
+	spin_lock_init(&memcg->cache_ext_file_stats.lock);
+	hash_init(memcg->cache_ext_inode_stats.table);
+	spin_lock_init(&memcg->cache_ext_inode_stats.lock);
+
+	for_each_node(node) {
+		pn = memcg->nodeinfo[node];
+		if (!pn)
+			return -EINVAL;
+
+		si_meminfo(&si);
+		memory_in_bytes = si.totalram * si.mem_unit;
+		max_num_pages = memory_in_bytes / PAGE_SIZE;
+		num_buckets = roundup_pow_of_two(max_num_pages);
+
+		pn->valid_folios_set = init_valid_folios_set(node, num_buckets);
+		if (!pn->valid_folios_set) {
+			pr_err("cache_ext: failed to init valid folios set for node %d\n",
+			       node);
+			cache_ext_memcg_exit(memcg);
+			return -ENOMEM;
+		}
+		cache_ext_ds_registry_init(&pn->cache_ext_ds_registry);
+	}
+
+	memcg->cache_ext_valid = true;
+	return 0;
+}
+
+void cache_ext_memcg_exit(struct mem_cgroup *memcg)
+{
+	int node;
+	struct mem_cgroup_per_node *pn;
+	struct cache_ext_inode_stats_entry *entry;
+	struct cache_ext_file_stats_entry *file_entry;
+	struct hlist_node *tmp;
+	int bkt;
+
+	if (!memcg || !memcg->cache_ext_valid)
+		return;
+
+	cache_ext_ds_registry_del_all(memcg);
+
+	for_each_node(node) {
+		pn = memcg->nodeinfo[node];
+		if (!pn)
+			continue;
+		if (pn->valid_folios_set) {
+			free_valid_folios_set(pn->valid_folios_set);
+			pn->valid_folios_set = NULL;
+		}
+	}
+
+	spin_lock(&memcg->cache_ext_file_stats.lock);
+	hash_for_each_safe(memcg->cache_ext_file_stats.table, bkt, tmp, file_entry, h_node) {
+		hash_del(&file_entry->h_node);
+		kfree(file_entry);
+	}
+	spin_unlock(&memcg->cache_ext_file_stats.lock);
+
+	spin_lock(&memcg->cache_ext_inode_stats.lock);
+	hash_for_each_safe(memcg->cache_ext_inode_stats.table, bkt, tmp, entry, h_node) {
+		hash_del(&entry->h_node);
+		kfree(entry);
+	}
+	spin_unlock(&memcg->cache_ext_inode_stats.lock);
+
+	memcg->cache_ext_valid = false;
+}
+#endif /* CONFIG_CACHE_EXT */
 
 #define SEQ_BUF_SIZE SZ_4K
 #define CURRENT_OBJCG_UPDATE_BIT 0
@@ -3910,6 +4510,13 @@ static void free_mem_cgroup_per_node_info(struct mem_cgroup_per_node *pn)
 	if (!pn)
 		return;
 
+#ifdef CONFIG_CACHE_EXT
+	if (pn->valid_folios_set) {
+		free_valid_folios_set(pn->valid_folios_set);
+		pn->valid_folios_set = NULL;
+	}
+#endif
+
 	free_percpu(pn->lruvec_stats_percpu);
 	kfree(pn->lruvec_stats);
 	kfree(pn);
@@ -3938,6 +4545,9 @@ static bool alloc_mem_cgroup_per_node_info(struct mem_cgroup *memcg, int node)
 
 	lruvec_init(&pn->lruvec);
 	pn->memcg = memcg;
+#ifdef CONFIG_CACHE_EXT
+	pn->valid_folios_set = NULL;
+#endif
 
 	memcg->nodeinfo[node] = pn;
 	return true;
